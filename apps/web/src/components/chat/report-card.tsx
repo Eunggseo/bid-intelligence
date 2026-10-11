@@ -1,0 +1,771 @@
+"use client";
+
+import { useState } from "react";
+import { motion } from "motion/react";
+import { AlertTriangle, Check, ChevronDown, Copy, Download, FileText, Info, Users } from "lucide-react";
+import { type FinalReport, type FinalGotcha, type Competitor, type CompetitorStats, type ScopedRate,
+  competitorNames } from "@/lib/chat-data";
+import { type GapCell, CARRIED_LABELS, QUANTITY_LABEL, QUANTITY_NOTE, carriedCell, millingCell }
+  from "@/lib/gap-status";
+import { Eyebrow, Chip } from "@/components/kit";
+import { PitAccessMap } from "./pit-access-map";
+
+// ────────────────────────────────────────────────────────────────────────────
+// The signature artifact: a readable plan REPORT CARD rendered INLINE in the
+// conversation right after the processing narration. Built from the REAL
+// assembled report (FastAPI /api/report → final), not the mock. Every figure is
+// pinned to its source page. (Visual redesign is a later phase — this renders the
+// real data faithfully.)
+// ────────────────────────────────────────────────────────────────────────────
+
+// Identity fields we surface, in display order, with friendly labels.
+// Order (client request): State (full) → County → Project no. → Location, then the rest.
+const IDENTITY_LABELS: [string, string][] = [
+  ["state", "State"],
+  ["county", "County"],
+  ["sp_number", "Project no."],
+  ["location", "Location"],
+  ["traffic_level", "Traffic level"],
+  ["construction_start", "Construction start"],
+];
+
+// Identity fields that carry a THREE-VALUED presence (`<field>_status`) from the backend, rendered
+// through lib/gap-status.ts. These are never filtered out and never render an em dash: for these
+// the backend tells us WHICH of "the plan says none" / "we never read it" is true, so collapsing
+// them into one blank cell throws away the only thing that distinguishes them.
+//
+// HELD — the shape-dependent half. `hot_mix_unconverted` / `base_unconverted` /
+// `shoulder_unconverted` belong in this list (their labels are already in payload_carry._LABELS),
+// but HOW an off-unit bucket reaches the payload is undecided (2a's verbatim capture vs #102's
+// merged totals), and under 2a the value may be an ARRAY of items rather than a string. Adding the
+// three tuples here — plus BUCKET_UNIT_CELL in gap-status.ts and a per-bucket "Measured in" row —
+// is the whole of that half. Spec: docs/_spec/2026-08-10-frontend-gap-rendering.md §5.
+const GAP_FIELDS: [string, string][] = [
+  ["phasing_requirements", CARRIED_LABELS.phasing_requirements],
+];
+
+// Two-letter DOT state code → full name (we surface the full state, not the abbreviation).
+const STATE_NAMES: Record<string, string> = {
+  ND: "North Dakota", MN: "Minnesota", SD: "South Dakota", MT: "Montana", IA: "Iowa", WI: "Wisconsin",
+};
+
+function fmtVal(v: string | number | boolean | null): string {
+  if (v === null || v === undefined || v === "") return "—";
+  if (typeof v === "boolean") return v ? "Yes" : "No";
+  return String(v);
+}
+
+// A clean "County County, ST" place label from the identity (skips empty parts).
+function placeLabel(identity: Record<string, string | number | boolean | null>): string {
+  const county = fmtVal(identity.county ?? null);
+  const state = fmtVal(identity.state ?? null);
+  const parts: string[] = [];
+  if (county !== "—") parts.push(`${county} County`);
+  if (state !== "—") parts.push(String(state));
+  return parts.join(", ");
+}
+
+// Per-field display formatting. A plan can bundle several SAP/contract numbers — show the
+// first and collapse the rest ("SAP 012-604-021 +4 more") instead of a wall of numbers.
+function fmtIdentity(key: string, v: string | number | boolean | null): string {
+  const s = fmtVal(v);
+  if (key === "state" && s !== "—") return STATE_NAMES[s.toUpperCase()] ?? s;
+  if (key === "sp_number" && s !== "—") {
+    const parts = s.split(",").map((p) => p.trim()).filter(Boolean);
+    if (parts.length > 1) return `${parts[0]} +${parts.length - 1} more`;
+  }
+  return s;
+}
+
+// Taxonomy codes (PHASING_SEQUENCED) → a readable title ("Phasing Sequenced").
+function humanize(code: string): string {
+  return code
+    .toLowerCase()
+    .split(/[_\s]+/)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(" ");
+}
+
+// Copy the EXPORT's markdown, byte for byte. This used to be a second, hand-built markdown
+// renderer (`reportToMarkdown`) that silently drifted from /api/report/export — and it already
+// HAD: it skipped identity rows whose value was empty, so a user who copied from the UI got a
+// SHORTER report than the same user who downloaded it, with no signal that anything was missing.
+// Now the backend is the single renderer and the UI just relays it.
+//
+// Returns null on success, or an error STRING the caller surfaces — a failure and a good copy
+// never share a return value, and on failure NOTHING is written to the clipboard. A partial or
+// stale copy must not look like a good one.
+//
+// `deps` is injectable purely so the coverage test can drive it without a DOM
+// (tests/2026-08-10-report-card-gaps.test.mjs, T9).
+export async function copyReportMarkdown(
+  final: FinalReport,
+  deps?: { fetch?: typeof fetch; writeText?: (t: string) => Promise<void> },
+): Promise<string | null> {
+  const doFetch = deps?.fetch ?? globalThis.fetch;
+  const writeText = deps?.writeText
+    ?? ((t: string) => navigator.clipboard.writeText(t));
+  let res: Response;
+  try {
+    res = await doFetch("/api/report/export", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ final, fmt: "md" }),
+    });
+  } catch {
+    return "Couldn't reach the export service.";
+  }
+  if (!res.ok) return `Export failed (${res.status}).`;
+  const text = await res.text();
+  if (!text.trim()) return "The export came back empty.";
+  try {
+    await writeText(text);
+  } catch {
+    return "Couldn't write to the clipboard.";
+  }
+  return null;
+}
+
+// POST the assembled report to the export proxy and trigger a browser download of the returned
+// file. Returns an error string on failure (the caller surfaces it) or null on success.
+async function downloadReport(final: FinalReport, fmt: "md" | "csv" | "pdf"): Promise<string | null> {
+  let res: Response;
+  try {
+    res = await fetch("/api/report/export", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ final, fmt }),
+    });
+  } catch {
+    return "Couldn't reach the export service.";
+  }
+  if (!res.ok) {
+    let msg = `Export failed (${res.status}).`;
+    try {
+      const j = await res.json();
+      if (j?.message) msg = j.message;
+    } catch {
+      /* not JSON — keep the status message */
+    }
+    return msg;
+  }
+  const blob = await res.blob();
+  if (!blob.size) return "The export came back empty.";
+  // honor the filename the backend set in Content-Disposition; fall back to a sane stem
+  const cd = res.headers.get("content-disposition") ?? "";
+  const m = cd.match(/filename="?([^"]+)"?/);
+  const name = m?.[1] ?? `bid-report.${fmt}`;
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  a.rel = "noopener";
+  a.style.display = "none";
+  document.body.appendChild(a);
+  a.click();
+  // Defer cleanup — revoking the object URL synchronously right after click() cancels the
+  // download in Chrome/Safari before it starts reading the blob (the "button does nothing" bug).
+  setTimeout(() => {
+    a.remove();
+    URL.revokeObjectURL(url);
+  }, 2000);
+  return null;
+}
+
+export function ReportCard({ final }: { final?: FinalReport }) {
+  const [copied, setCopied] = useState(false);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [dlError, setDlError] = useState<string | null>(null);
+
+  if (!final) {
+    return (
+      <div className="glass-strong rounded-2xl border border-black/[0.06] px-4 py-3 text-[13px] text-muted-foreground">
+        Report data unavailable — re-drop the plan PDF.
+      </div>
+    );
+  }
+
+  const copy = async () => {
+    setDlError(null);
+    const err = await copyReportMarkdown(final);
+    if (err) return setDlError(err);   // never a silent short copy
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
+  };
+
+  const goNoGo = final.gotchas.go_no_go ?? [];
+  const pricing = final.gotchas.pricing ?? [];
+  const allGotchas: FinalGotcha[] = [...goNoGo, ...pricing];
+
+  // F2 — a gap must render visibly wrong, not blank. The empty-row filter that used to live here
+  // is GONE: an absent field became an absent row, so a plan whose phasing we never read looked
+  // exactly like a plan with no phasing section.
+  //
+  // Two lists, two deliberately different contracts:
+  //  · the six base fields KEEP fmtVal's em dash, because final_report.py renders those same six
+  //    with `or "—"` in the export and the UI diverging from the export is the bug the clipboard
+  //    fix above closes, not one to introduce here. Crucially the backend sends NO presence signal
+  //    for these six, so the UI genuinely cannot tell "the plan says nothing" from "extraction
+  //    failed" — printing a status we do not have would be fabricating one. Follow-up F2b: give
+  //    them payload_carry-style presence keys, then this em dash goes too.
+  //  · the carried/gap fields below are never filtered, never em-dashed, and always a GapCell.
+  const identityRows = IDENTITY_LABELS;
+  const gapRows: [string, string, GapCell][] =
+    GAP_FIELDS.map(([k, label]) => [k, label, carriedCell(final.identity, k)]);
+  const milling = millingCell(final.identity, final.quantities.map((q) => q.label));
+  if (milling) gapRows.push(["milling_unit_status", "Milling measured in", milling]);
+
+  const bidDate = final.competitor?.bid_date || null;
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 10 }}
+      animate={{ opacity: 1, y: 0 }}
+      transition={{ type: "spring", stiffness: 200, damping: 26 }}
+      className="overflow-hidden rounded-2xl border border-black/[0.08] bg-white elev-md"
+    >
+      {/* Masthead — reads as a report cover, not a chat bubble */}
+      <div className="border-b-2 border-primary/25 px-7 pt-7 pb-5">
+        <div className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-[0.16em] text-primary">
+          <FileText className="h-3.5 w-3.5" /> Bid Intelligence Report
+        </div>
+        <h3 className="mt-2.5 font-serif text-[32px] leading-[1.08] tracking-tight">{final.title}</h3>
+        <p className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[14px] text-muted-foreground">
+          <span className="font-medium text-foreground/75">{final.archetype}</span>
+          {final.pages ? <><span className="text-muted-foreground/40">·</span><span>{final.pages} pp</span></> : null}
+          {allGotchas.length > 0 && <><span className="text-muted-foreground/40">·</span><span>{allGotchas.length} gotchas</span></>}
+          {bidDate && <><span className="text-muted-foreground/40">·</span><span>Bid {bidDate}</span></>}
+        </p>
+      </div>
+
+      {/* Body */}
+      <div className="space-y-7 px-7 py-6">
+        {/* Headline summary — scannable "what is this" BEFORE the detail: bold work-type + place,
+            then counts + top watch-item as pills (a paragraph here was hard to read). */}
+        <Headline
+          archetype={final.archetype}
+          place={placeLabel(final.identity)}
+          goNoGo={goNoGo.length}
+          pricing={pricing.length}
+          wage={final.identity.prevailing_wages === true}
+          watch={goNoGo[0] ? humanize(goNoGo[0].code) : pricing[0] ? humanize(pricing[0].code) : null}
+        />
+
+        {/* ① Snapshot — dates strip + project identity, merged (all quick-scan facts in one place) */}
+        <section>
+          <SectionHeader n={1} title="Snapshot" />
+          {/* Dates lead — Adam checks bid deadline + completion first, and they're scattered/hard to find */}
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+            <Snapshot label="Bid deadline" value={fmtVal(final.identity.bid_deadline)} accent />
+            <Snapshot label="Substantial completion" value={fmtVal(final.identity.substantial_completion ?? final.identity.construction_end)} />
+            <Snapshot label="Final completion" value={fmtVal(final.identity.final_completion)} />
+            <Snapshot label="Prevailing wage" value={fmtVal(final.identity.prevailing_wages)} />
+          </div>
+          {(identityRows.length > 0 || gapRows.length > 0) && (
+            <dl className="mt-4 grid grid-cols-1 gap-x-8 gap-y-2 sm:grid-cols-2">
+              {identityRows.map(([k, label]) => (
+                <div key={k} className="flex items-baseline justify-between gap-3 border-b border-black/[0.04] py-1.5">
+                  <dt className="shrink-0 text-[13px] text-muted-foreground">{label}</dt>
+                  <dd className="line-clamp-2 text-right text-[15px] font-medium" title={fmtVal(final.identity[k])}>
+                    {fmtIdentity(k, final.identity[k])}
+                  </dd>
+                </div>
+              ))}
+              {gapRows.map(([k, label, cell]) => (
+                <GapRow key={k} label={label} cell={cell} />
+              ))}
+            </dl>
+          )}
+        </section>
+
+        {/* ② Headline quantities */}
+        {final.quantities.length > 0 && (
+          <section>
+            <SectionHeader n={2} title="Materials & quantities" aside="bid schedule" />
+            <div className="overflow-hidden rounded-xl border border-black/[0.08]">
+              <table className="w-full text-[15px]">
+                <thead className="bg-secondary/50">
+                  <tr>
+                    <th className="px-4 py-2.5 text-left text-[12px] font-medium uppercase tracking-wide text-muted-foreground">Item</th>
+                    <th className="px-4 py-2.5 text-right text-[12px] font-medium uppercase tracking-wide text-muted-foreground">Quantity</th>
+                    <th className="px-4 py-2.5 text-left text-[12px] font-medium uppercase tracking-wide text-muted-foreground">Unit</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {final.quantities.map((q, i) => (
+                    <tr key={`${q.label}-${i}`} className="border-t border-black/[0.05] odd:bg-black/[0.015]">
+                      {/* The WIRE label is authoritative and unchanged — bid_projects_record.py
+                          writes it into the `mill_sy` column and competitor_predict_live.py maps
+                          "MILL" into fitted weights. Only the presentation is glossed, so
+                          MILL_TON does not read as a typo to an estimator. */}
+                      <td className="px-4 py-2.5 font-medium">
+                        {QUANTITY_LABEL[q.label] ?? q.label}
+                        {QUANTITY_NOTE[q.label] && (
+                          <span className="ml-1 cursor-help text-muted-foreground/70" title={QUANTITY_NOTE[q.label]}>ⓘ</span>
+                        )}
+                      </td>
+                      <td className="px-4 py-2.5 text-right font-mono tnum">
+                        {typeof q.value === "number" ? q.value.toLocaleString() : q.value}
+                      </td>
+                      <td className="px-4 py-2.5 text-[14px] text-muted-foreground">{q.unit}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              {final.quantities.some((q) => q.label === "MILL_TON") && (
+                <p className="border-t border-black/[0.06] bg-secondary/20 px-4 py-2 text-[12px] text-muted-foreground">
+                  {QUANTITY_NOTE.MILL_TON}
+                </p>
+              )}
+            </div>
+          </section>
+        )}
+
+        {/* ④ Gotchas — ALL flagged types, split Go/No-Go vs Pricing, each with verbatim evidence + page */}
+        {allGotchas.length > 0 && (
+          <section>
+            <SectionHeader n={3} title="Gotchas" aside={`${allGotchas.length} flagged`} />
+            <div className="space-y-4">
+              {goNoGo.length > 0 && (
+                <GotchaGroup title="Go / No-Go" hint="bid-or-pass risk" tone="warn" items={goNoGo} />
+              )}
+              {pricing.length > 0 && (
+                <GotchaGroup title="Pricing" hint="affects how you price" tone="primary" items={pricing} />
+              )}
+            </div>
+          </section>
+        )}
+
+        {/* ⑤ Competitive landscape — the matched / live-generated Competitor Intel report */}
+        <section>
+          <SectionHeader n={4} title="Competitive landscape" />
+          {final.competitor ? (
+            <CompetitorSection comp={final.competitor} identity={final.identity} />
+          ) : (
+            <p className="rounded-xl border border-black/[0.06] bg-secondary/30 px-3 py-2.5 text-[12px] text-muted-foreground">
+              No competitor-intel report matched this project (by county + state + date).
+            </p>
+          )}
+        </section>
+
+        {/* Footer — a quick "what I did" recap + the downloads (they live here, not up top) */}
+        <div className="border-t border-black/[0.07] pt-4">
+          <p className="text-[13.5px] leading-relaxed text-muted-foreground">
+            Read {final.pages ? `${final.pages} pages` : "the plan"} end to end · pinned every figure to its source page ·
+            extracted {final.quantities.length} bid-schedule item{final.quantities.length === 1 ? "" : "s"} and flagged {allGotchas.length} gotcha{allGotchas.length === 1 ? "" : "s"}.
+          </p>
+          <div className="mt-3 flex flex-wrap items-center gap-1.5">
+            <span className="mr-1 text-[12px] font-medium text-foreground/70">Download</span>
+            {(["pdf", "csv", "md"] as const).map((fmt) => (
+              <button
+                key={fmt}
+                onClick={async () => {
+                  setBusy(fmt);
+                  setDlError(null);
+                  try {
+                    const err = await downloadReport(final, fmt);
+                    if (err) setDlError(err);
+                  } finally {
+                    setBusy(null);
+                  }
+                }}
+                disabled={busy !== null}
+                title={`Download report as ${fmt.toUpperCase()}`}
+                className="flex items-center gap-1 rounded-lg border border-black/10 px-2.5 py-1 text-[11px] font-medium text-muted-foreground transition-colors hover:border-primary/30 hover:text-primary disabled:opacity-50"
+              >
+                <Download className="h-3 w-3" />
+                {busy === fmt ? "…" : fmt.toUpperCase()}
+              </button>
+            ))}
+            <button
+              onClick={copy}
+              title="Copy report as Markdown"
+              className="ml-1 flex items-center gap-1 rounded-lg border border-black/10 px-2.5 py-1 text-[11px] font-medium text-muted-foreground transition-colors hover:border-primary/30 hover:text-primary"
+            >
+              {copied ? <Check className="h-3 w-3 text-[var(--positive)]" /> : <Copy className="h-3 w-3" />}
+              {copied ? "Copied" : "Copy"}
+            </button>
+          </div>
+          {dlError && (
+            <p className="mt-2 text-[12px] text-[var(--negative)]">{dlError} — try again or use Copy.</p>
+          )}
+        </div>
+      </div>
+    </motion.div>
+  );
+}
+
+// A numbered report section header with a divider — gives the card its "document" feel.
+function SectionHeader({ n, title, aside }: { n: number; title: string; aside?: React.ReactNode }) {
+  return (
+    <div className="mb-3.5 flex items-center gap-2.5 border-b border-black/[0.07] pb-2">
+      <span className="grid h-6 w-6 shrink-0 place-items-center rounded-md bg-primary/10 font-serif text-[13px] font-semibold text-primary">
+        {n}
+      </span>
+      <h4 className="font-serif text-[19px] tracking-tight">{title}</h4>
+      {aside && <span className="ml-auto text-[11px] uppercase tracking-wide text-muted-foreground">{aside}</span>}
+    </div>
+  );
+}
+
+// The scannable headline summary — bold work-type + place, then counts + watch-item as pills.
+function Headline({
+  archetype,
+  place,
+  goNoGo,
+  pricing,
+  wage,
+  watch,
+}: {
+  archetype: string;
+  place: string;
+  goNoGo: number;
+  pricing: number;
+  wage: boolean;
+  watch: string | null;
+}) {
+  return (
+    <div className="rounded-2xl border border-primary/20 bg-primary/[0.05] px-5 py-4">
+      <p className="text-[18px] font-semibold leading-snug tracking-tight text-foreground">
+        {archetype}
+        {place && <span className="font-normal text-muted-foreground"> · {place}</span>}
+      </p>
+      <div className="mt-3 flex flex-wrap items-center gap-2">
+        <Chip tone={goNoGo > 0 ? "warn" : "neutral"} className="px-2.5 py-1 text-[12px]">{goNoGo} go / no-go</Chip>
+        <Chip tone={pricing > 0 ? "primary" : "neutral"} className="px-2.5 py-1 text-[12px]">{pricing} pricing</Chip>
+        {wage && <Chip tone="neutral" className="px-2.5 py-1 text-[12px]">Prevailing wage</Chip>}
+      </div>
+      {watch && (
+        <p className="mt-2.5 text-[13.5px] text-muted-foreground">
+          Top watch-item: <span className="font-medium text-foreground">{watch}</span>
+        </p>
+      )}
+    </div>
+  );
+}
+
+// A single quick-scan fact in the snapshot strip. `accent` highlights a key figure (e.g. completion date).
+function Snapshot({ label, value, accent }: { label: string; value: string; accent?: boolean }) {
+  return (
+    <div className={`rounded-xl border px-3.5 py-2.5 ${accent ? "border-primary/25 bg-primary/[0.05]" : "border-black/[0.06] bg-card/60"}`}>
+      <div className="text-[11px] uppercase tracking-wide text-muted-foreground">{label}</div>
+      <div className="mt-1 truncate text-[16px] font-medium" title={value}>{value}</div>
+    </div>
+  );
+}
+
+// One §① row whose value may be a gap state. THREE visually distinct outcomes and never a blank
+// cell: a real value, a muted "None stated in the plan", and a loud amber "Not captured".
+// "We never read it" vs "the plan says none" is carried by three independent channels — colour
+// (amber vs muted), an icon (present vs absent) and the wording. One channel is enough for a test;
+// three are enough for an estimator glancing at a screen.
+// `data-gap` is the test surface (tests/2026-08-10-report-card-gaps.test.mjs).
+function GapRow({ label, cell }: { label: string; cell: GapCell }) {
+  return (
+    <div className="flex items-baseline justify-between gap-3 border-b border-black/[0.04] py-1.5">
+      <dt className="shrink-0 text-[13px] text-muted-foreground">{label}</dt>
+      <dd className="line-clamp-2 text-right text-[15px]" data-gap={cell.tone} title={cell.text}>
+        <GapText cell={cell} />
+      </dd>
+    </div>
+  );
+}
+
+function GapText({ cell }: { cell: GapCell }) {
+  if (cell.tone === "value") return <span className="font-medium">{cell.text}</span>;
+  if (cell.tone === "empty") return <span className="italic text-muted-foreground">{cell.text}</span>;
+  return (
+    <span className="inline-flex items-center gap-1 rounded-md bg-[var(--warn)]/[0.12] px-1.5 py-0.5 text-[13px] font-medium text-[var(--warn)]">
+      <AlertTriangle className="h-3.5 w-3.5 shrink-0" /> {cell.text}
+    </span>
+  );
+}
+
+// A labeled group of gotchas (Go/No-Go or Pricing) — shows ALL flagged types, each with its
+// humanized name, verbatim evidence, and source page.
+function GotchaGroup({
+  title,
+  hint,
+  tone,
+  items,
+}: {
+  title: string;
+  hint: string;
+  tone: "warn" | "primary";
+  items: FinalGotcha[];
+}) {
+  const accent = tone === "warn" ? "var(--warn)" : "var(--primary)";
+  return (
+    <div>
+      <div className="flex items-baseline justify-between">
+        <Eyebrow>{title}</Eyebrow>
+        <span className="text-[10px] text-muted-foreground">{items.length} · {hint}</span>
+      </div>
+      <div className="mt-2 space-y-1.5">
+        {items.map((g, i) => (
+          <div
+            key={`${g.code}-${i}`}
+            className="rounded-xl border border-black/[0.06] bg-card/70 p-3"
+            style={{ borderLeft: `3px solid ${accent}` }}
+          >
+            <div className="flex items-center gap-2">
+              <span className="text-[15px] font-medium">{humanize(g.code)}</span>
+              {g.page != null && (
+                <span className="ml-auto shrink-0 font-mono text-[11px] text-muted-foreground/70">p.{g.page}</span>
+              )}
+            </div>
+            {g.evidence && (
+              <p className="mt-1.5 line-clamp-3 text-[13px] italic leading-snug text-muted-foreground" title={g.evidence}>
+                &ldquo;{g.evidence}&rdquo;
+              </p>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ── Competitive landscape (§④) — CI team's v3 schema ────────────────────────
+// A single flat top-N ranking (no Priority/Discovery tiers — CLIENT's tracked-list membership never
+// drove the ranking, only a display grouping that's now gone). Selection/ranking is still the
+// planner's simple_rule_score model; every competitor's shown figures (win rate, bid rate,
+// capacity, pit access) come entirely from the live SQL retrieval in competitor_stats_live.py
+// (`comp.stats`) — no invented scores, and no more of the old markdown-parsed narrative bullets.
+// MERGE 2026-08-10: upstream (#90) removed the match-confidence chip, so MATCH_TONE/conf/matchTone
+// are gone with it — deliberately not resurrected. Two things from our side are kept:
+//   1. `export` — the coverage test renders this component directly via react-dom/server.
+//   2. the competitorNames() flatten below.
+export function CompetitorSection({
+  comp, identity,
+}: {
+  comp: Competitor;
+  identity?: Record<string, string | number | boolean | null>;
+}) {
+  const s = comp.summary ?? { analyzed: 0, narrative: "" };
+  const originLat = typeof identity?.latitude === "number" ? identity.latitude : null;
+  const originLon = typeof identity?.longitude === "number" ? identity.longitude : null;
+  // Which pit row is "active" -- clicking a list row opens that marker on the map below;
+  // clicking a marker highlights its row back (see PitAccessMap's onMarkerClick), so the two
+  // stay in sync regardless of which one the user interacts with first.
+  const [selectedPitIndex, setSelectedPitIndex] = useState<number | null>(null);
+  // The name boundary. The wire list may hold `{ name, tier }` objects (see chat-data.ts) —
+  // rendering one directly threw "Objects are not valid as a React child" and took the whole
+  // card down. ci_model's executor.py still emits `tier` and is CI-owned, so this stays.
+  // Flatten here, once, and nothing below ever sees anything but a string.
+  const names = competitorNames(comp.competitors);
+  const userAddedSet = new Set(competitorNames(comp.user_added));
+
+  return (
+    <div>
+      {/* Pit access overview — NOT the competitor list itself, kept as its own labeled block so
+          site-level material-source facts and "who's likely to bid" read as two separate
+          questions. Work type/condition dropped 2026-08-11: §① Plan Snapshot (plan_reader's own
+          extraction) already shows the project type, so repeating it here was redundant. */}
+      <div className="rounded-2xl border border-black/[0.08] bg-secondary/30 p-4">
+        <div className="flex items-center gap-2 text-[15px] font-medium text-foreground">
+          <Info className="h-[18px] w-[18px] text-primary" />
+          Pit access overview
+        </div>
+
+        {comp.pits?.public_pits && comp.pits.public_pits.length > 0 ? (
+          <div className="mt-3 text-[12.5px] text-muted-foreground">
+            <p>{comp.pits.public_pits.length} nearest public-access pit(s) — click a name to find it on the map:</p>
+            {comp.pits.public_pits.map((p, i) => (
+              <button
+                key={`${p.name}-${i}`}
+                type="button"
+                onClick={() => setSelectedPitIndex(i)}
+                className={`block w-full pl-3 text-left hover:text-foreground ${selectedPitIndex === i ? "font-medium text-foreground" : ""}`}
+              >
+                {p.name} ({p.distance_miles.toFixed(1)} mi
+                {p.quality != null ? `, quality ${p.quality}` : ""})
+              </button>
+            ))}
+          </div>
+        ) : (
+          comp.pits?.public && (
+            <p className="mt-3 text-[12.5px] text-muted-foreground">{comp.pits.public}</p>
+          )
+        )}
+        {/* Map only once we have both a project location and at least one pit to plot -- lets
+            same-named pits at genuinely different coordinates (a real scratch.mn_pit_list pattern)
+            show up as visibly separate points instead of indistinguishable list rows. */}
+        {originLat != null && originLon != null && comp.pits?.public_pits && comp.pits.public_pits.length > 0 && (
+          <PitAccessMap
+            origin={{ lat: originLat, lon: originLon }}
+            pits={comp.pits.public_pits}
+            selectedIndex={selectedPitIndex}
+            onMarkerClick={setSelectedPitIndex}
+          />
+        )}
+      </div>
+
+      {/* Ranked list — best match first. Estimator-added names (typed in via the verify-competitors
+          popup) get the same live win_rate/bid_rate/capacity/pit_access retrieval as everyone else,
+          just a "you added" badge to distinguish them from the model's own picks. Heading sits
+          directly above the actual names, not above the project-overview block above. */}
+      <div className="mt-4 flex items-center gap-2 text-[15px] font-medium text-foreground">
+        <Users className="h-[18px] w-[18px] text-primary" />
+        Top {s.analyzed} likely competitors
+      </div>
+      {/* A matched report that names nobody is a legitimate empty answer — say so, so it can never
+          be mistaken for the failed-lookup case (comp == null, handled by the caller). */}
+      {names.length === 0 && (
+        <p className="mt-2.5 text-[12.5px] text-muted-foreground">
+          This report matched, but it names no competitors.
+        </p>
+      )}
+      {names.length > 0 && (
+        <div className="mt-2.5 space-y-1.5">
+          {names.map((name) => (
+            <CompetitorRow
+              key={name}
+              name={name}
+              stats={comp.stats?.[name]}
+              accent={userAddedSet.has(name) ? "var(--primary)" : "var(--muted-foreground)"}
+              isUserAdded={userAddedSet.has(name)}
+            />
+          ))}
+        </div>
+      )}
+
+      <p className="mt-2 text-[10px] text-muted-foreground/70">
+        Source: {comp.source_file} · Competitor Intelligence model
+      </p>
+    </div>
+  );
+}
+
+// One competitor: name + a one-line state win/bid-rate summary inline, expandable to the full
+// live-retrieved win/bid rate, capacity, and pit-access figures (same regardless of origin).
+function CompetitorRow({
+  name, stats, accent, isUserAdded,
+}: {
+  name: string;
+  stats?: CompetitorStats;
+  accent: string;
+  isUserAdded?: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const expandable = Boolean(stats && (stats.win_rate || stats.bid_rate || stats.capacity || stats.pit_access));
+  const stateWinRate = stats?.win_rate?.state;
+  const stateBidRate = stats?.bid_rate?.state;
+  const inline = [
+    stateWinRate?.pct != null ? `${fmtPct(stateWinRate.pct)} win rate` : null,
+    stateBidRate?.pct != null ? `${fmtPct(stateBidRate.pct)} bid rate` : null,
+  ].filter(Boolean) as string[];
+
+  return (
+    <div className="rounded-xl border border-black/[0.06] bg-card/70 p-2.5" style={{ borderLeft: `3px solid ${accent}` }}>
+      <button
+        onClick={() => expandable && setOpen((v) => !v)}
+        className="flex w-full items-center gap-2 text-left"
+        disabled={!expandable}
+      >
+        <span className="text-[14px] font-medium">{name}</span>
+        {isUserAdded && <Chip tone="primary">you added</Chip>}
+        {expandable && (
+          <ChevronDown className={`ml-auto h-4 w-4 shrink-0 text-muted-foreground transition-transform ${open ? "rotate-180" : ""}`} />
+        )}
+      </button>
+      {inline.length > 0 && !open && (
+        <p className="mt-1 line-clamp-1 text-[12.5px] text-muted-foreground" title={inline.join(" · ")}>
+          {inline.join(" · ")} <span className="opacity-60">(state)</span>
+        </p>
+      )}
+      {open && <CompetitorStatsBlock stats={stats} />}
+    </div>
+  );
+}
+
+function fmtPct(pct: number | null | undefined): string {
+  return pct == null ? "—" : `${Math.round(pct * 100)}%`;
+}
+
+// Full-sentence, one-scope-per-line phrasing for the win/bid rate blocks -- win_rate is wins/bids
+// ("of the times they bid, how often did they win"), bid_rate is bids/total ("of the projects they
+// were eligible for, how often did they bid at all") -- genuinely different denominators, so they
+// need different wording, not the same template with a relabeled noun.
+function fmtWinRateSentence(r?: ScopedRate): string {
+  if (!r || r.wins == null || r.bids == null) return r?.pct != null ? fmtPct(r.pct) : "—";
+  return `${r.wins} of ${r.bids} bid${r.bids === 1 ? "" : "s"} won (${fmtPct(r.pct)})`;
+}
+
+function fmtBidRateSentence(r?: ScopedRate): string {
+  if (!r || r.bids == null || r.total == null) return r?.pct != null ? fmtPct(r.pct) : "—";
+  return `${r.bids} of ${r.total} eligible project${r.total === 1 ? "" : "s"} bid on (${fmtPct(r.pct)})`;
+}
+
+function fmtTons(t: number | null | undefined): string {
+  return t == null ? "—" : `${Math.round(t).toLocaleString()} tons`;
+}
+
+// The live-retrieved figures every competitor gets, model-predicted or estimator-added alike — win rate / bid rate
+// (each scoped 3 ways: state, county, project type), capacity (this-year pace vs. historical
+// average), and pit access (nearest usable pit + count/quality within 25mi).
+function CompetitorStatsBlock({ stats }: { stats?: CompetitorStats }) {
+  if (!stats) return null;
+  const { win_rate, bid_rate, capacity, pit_access } = stats;
+  if (!win_rate && !bid_rate && !capacity && !pit_access) return null;
+
+  return (
+    <div className="mt-2 grid grid-cols-1 gap-1.5 border-t border-black/[0.06] pt-2 text-[11px] sm:grid-cols-2">
+      {win_rate && (
+        <div>
+          <div className="font-medium text-foreground/70">Win rate — of the projects they bid on, how often they won</div>
+          <div className="text-muted-foreground">
+            <div>State: {fmtWinRateSentence(win_rate.state)}</div>
+            <div>County: {fmtWinRateSentence(win_rate.county)}</div>
+            <div>Type: {fmtWinRateSentence(win_rate.project_type)}</div>
+          </div>
+        </div>
+      )}
+      {bid_rate && (
+        <div>
+          <div className="font-medium text-foreground/70">Bid rate — of projects they were eligible for, how often they bid at all</div>
+          <div className="text-muted-foreground">
+            <div>State: {fmtBidRateSentence(bid_rate.state)}</div>
+            <div>County: {fmtBidRateSentence(bid_rate.county)}</div>
+            <div>Type: {fmtBidRateSentence(bid_rate.project_type)}</div>
+          </div>
+        </div>
+      )}
+      {capacity && (
+        <div>
+          <div className="font-medium text-foreground/70">Capacity — how much they&apos;ve won this year vs. their usual pace</div>
+          <div className="text-muted-foreground">
+            {capacity.season_has_data === false ? (
+              "No results recorded for the current season yet — please upload this season's bid data to compute capacity."
+            ) : (
+              <>
+                {capacity.typical_capacity
+                  ? `Won ${fmtTons(capacity.ytd_won)} so far this year — ${fmtPct(capacity.capacity_pct)} of their average ${fmtTons(capacity.typical_capacity)}/year pace`
+                  : `Won ${fmtTons(capacity.ytd_won)} so far this year — no prior-year baseline to compare to yet`}
+                {capacity.last_year_total != null && ` (won ${fmtTons(capacity.last_year_total)} last year)`}
+              </>
+            )}
+          </div>
+        </div>
+      )}
+      {pit_access && (
+        <div>
+          <div className="font-medium text-foreground/70">Pit access — material source, closer usually means a cost/logistics edge</div>
+          <div className="text-muted-foreground">
+            {pit_access.nearest_owned_pit ? (
+              <span className="font-medium text-foreground/80">
+                Owns a pit {pit_access.nearest_owned_pit.distance_miles.toFixed(1)} mi away
+                ({pit_access.nearest_owned_pit.name}, quality {pit_access.nearest_owned_pit.quality ?? "—"})
+              </span>
+            ) : (
+              "Owns no pit near this site"
+            )}
+            {" — "}{pit_access.owned_pits_within_25mi_count} owned pit{pit_access.owned_pits_within_25mi_count === 1 ? "" : "s"} within 25 mi
+            {pit_access.owned_pits_within_25mi_avg_quality != null &&
+              ` (avg quality ${pit_access.owned_pits_within_25mi_avg_quality.toFixed(1)})`}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

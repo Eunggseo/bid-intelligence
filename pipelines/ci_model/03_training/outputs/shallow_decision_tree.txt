@@ -1,0 +1,91 @@
+if same_county_prior_bid_count <= 0.5000:
+  if prior_bid_rate <= 0.0473:
+    if same_project_type_bid_count <= 0.5000:
+      if prior_bid_rate <= 0.0073:
+        if days_since_last_bid <= 369.0022:
+          return prob=0.1203, samples=28945, positives=109
+        else:
+          return prob=0.3366, samples=2241, positives=31
+      else:
+        if log_mix_tons <= 7.0184:
+          return prob=0.3517, samples=8798, positives=130
+        else:
+          return prob=0.2236, samples=12030, positives=95
+    else:
+      if prior_bid_rate <= 0.0049:
+        if unknown_access_pits_within_25mi <= 38.3326:
+          return prob=0.3387, samples=3509, positives=49
+        else:
+          return prob=0.1334, samples=2832, positives=12
+      else:
+        if nearest_owned_or_restricted_pit_miles <= 42.3014:
+          return prob=0.8292, samples=338, positives=40
+        else:
+          return prob=0.4456, samples=17897, positives=389
+  else:
+    if ever_bid_same_project_type <= 0.5000:
+      if prior_bid_rate <= 0.1229:
+        if days_since_last_bid <= 27.1391:
+          return prob=0.4037, samples=3646, positives=67
+        else:
+          return prob=0.0000, samples=471, positives=0
+      else:
+        if log_mill_sy <= 5.8730:
+          return prob=0.4177, samples=360, positives=7
+        else:
+          return prob=0.6882, samples=539, positives=31
+    else:
+      if log_mix_tons <= 9.2974:
+        if competitor_pit_distance_advantage_vs_open <= -21.5340:
+          return prob=0.0826, samples=403, positives=1
+        else:
+          return prob=0.7783, samples=2634, positives=233
+      else:
+        if nearest_owned_or_restricted_pit_miles <= 56.9049:
+          return prob=0.9458, samples=249, positives=81
+        else:
+          return prob=0.8450, samples=1168, positives=153
+else:
+  if ever_bid_same_project_type <= 0.5000:
+    if same_county_prior_bid_count <= 1.5000:
+      if log_shldr_tons <= 5.2973:
+        if prior_bid_rate <= 0.0215:
+          return prob=0.6336, samples=1118, positives=51
+        else:
+          return prob=0.7872, samples=442, positives=41
+      else:
+        if best_open_pit_rating_within_25mi <= 4.5000:
+          return prob=0.1151, samples=279, positives=1
+        else:
+          return prob=0.5544, samples=421, positives=14
+    else:
+      if unknown_access_pits_within_25mi <= 46.9609:
+        if log_grading_yards <= 3.3869:
+          return prob=0.8070, samples=222, positives=23
+        else:
+          return prob=0.8911, samples=206, positives=38
+      else:
+        return prob=0.7183, samples=243, positives=16
+  else:
+    if same_project_type_bid_count <= 3.4500:
+      if unknown_access_pits_within_25mi <= 60.1652:
+        if days_since_last_bid <= 30.2935:
+          return prob=0.9014, samples=1006, positives=203
+        else:
+          return prob=0.8424, samples=629, positives=81
+      else:
+        if log_mix_tons <= 8.7401:
+          return prob=0.8453, samples=579, positives=76
+        else:
+          return prob=0.6475, samples=269, positives=13
+    else:
+      if log_mix_tons <= 8.4677:
+        if same_county_prior_bid_count <= 1.5000:
+          return prob=0.9081, samples=382, positives=82
+        else:
+          return prob=0.9435, samples=475, positives=150
+      else:
+        if same_project_type_bid_count <= 8.1000:
+          return prob=0.9543, samples=314, positives=115
+        else:
+          return prob=0.9813, samples=284, positives=168
